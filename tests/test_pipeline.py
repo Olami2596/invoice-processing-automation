@@ -3,6 +3,7 @@ from datetime import date
 from decimal import Decimal
 from src import pipeline
 from src.schemas import Invoice, InvoiceProcessingResult
+from src.quickbooks import create_bill_draft
 
 
 PDF_PATH = "data/fictional_invoice.pdf"
@@ -40,6 +41,32 @@ def make_valid_invoice():
         subtotal=Decimal("525000.00"),
         tax_amount=Decimal("39375.00"),
         total_amount=Decimal("564375.00"),
+    )
+
+
+@pytest.fixture(autouse=True)
+def isolate_pipeline_storage(monkeypatch):
+    """Prevent pipeline tests from accessing the real invoice database."""
+
+    # Return an empty database result by default.
+    monkeypatch.setattr(
+        pipeline,
+        "get_all_invoices",
+        lambda: [],
+    )
+
+    # Prevent tests from inserting records into the real invoice database.
+    monkeypatch.setattr(
+        pipeline,
+        "save_invoice",
+        lambda invoice, source_file: 1,
+    )
+
+    # Prevent tests from inserting records into the real QuickBooks database.
+    monkeypatch.setattr(
+        pipeline,
+        "save_quickbooks_draft",
+        lambda draft: 1,
     )
 
 
@@ -405,3 +432,530 @@ def test_ai_extraction_exception_propagates(monkeypatch):
         match="AI extraction failed.",
     ):
         pipeline.process_invoice(PDF_PATH)
+
+
+def test_process_invoice_loads_existing_invoices_when_omitted(
+    monkeypatch,
+):
+    """The pipeline should retrieve existing invoices when none are supplied."""
+
+    invoice = make_valid_invoice()
+    existing_invoices = [make_valid_invoice()]
+
+    get_all_invoices_calls = []
+
+    def mock_get_all_invoices():
+        get_all_invoices_calls.append(True)
+        return existing_invoices
+
+    monkeypatch.setattr(
+        pipeline,
+        "get_all_invoices",
+        mock_get_all_invoices,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "extract_text_from_pdf",
+        lambda pdf_path: "Extracted invoice text",
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "extract_invoice_data",
+        lambda invoice_text: invoice,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "validate_invoice",
+        lambda invoice, existing: [],
+    )
+
+    pipeline.process_invoice("data/fictional_invoice.pdf")
+
+    assert len(get_all_invoices_calls) == 1
+
+
+def test_process_invoice_passes_database_invoices_to_validation(
+    monkeypatch,
+):
+    """Invoices retrieved from storage should be passed to validate_invoice."""
+
+    invoice = make_valid_invoice()
+    existing_invoices = [make_valid_invoice()]
+
+    captured_invoices = {}
+
+    monkeypatch.setattr(
+        pipeline,
+        "get_all_invoices",
+        lambda: existing_invoices,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "extract_text_from_pdf",
+        lambda pdf_path: "Extracted invoice text",
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "extract_invoice_data",
+        lambda invoice_text: invoice,
+    )
+
+    def mock_validate_invoice(invoice, existing):
+        captured_invoices["existing"] = existing
+        return []
+
+    monkeypatch.setattr(
+        pipeline,
+        "validate_invoice",
+        mock_validate_invoice,
+    )
+
+    pipeline.process_invoice("data/fictional_invoice.pdf")
+
+    assert captured_invoices["existing"] is existing_invoices
+
+
+def test_process_invoice_does_not_load_database_when_existing_invoices_supplied(
+    monkeypatch,
+):
+    """Explicitly supplied invoices should prevent database retrieval."""
+
+    invoice = make_valid_invoice()
+    existing_invoices = [make_valid_invoice()]
+
+    def unexpected_database_call():
+        pytest.fail("get_all_invoices() should not have been called.")
+
+    monkeypatch.setattr(
+        pipeline,
+        "get_all_invoices",
+        unexpected_database_call,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "extract_text_from_pdf",
+        lambda pdf_path: "Extracted invoice text",
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "extract_invoice_data",
+        lambda invoice_text: invoice,
+    )
+
+    captured_invoices = {}
+
+    def mock_validate_invoice(invoice, existing):
+        captured_invoices["existing"] = existing
+        return []
+
+    monkeypatch.setattr(
+        pipeline,
+        "validate_invoice",
+        mock_validate_invoice,
+    )
+
+    pipeline.process_invoice(
+        "data/fictional_invoice.pdf",
+        existing_invoices=existing_invoices,
+    )
+
+    assert captured_invoices["existing"] is existing_invoices
+
+
+
+def test_process_invoice_respects_explicit_empty_existing_invoices(
+    monkeypatch,
+):
+    """An explicitly supplied empty list should not trigger database retrieval."""
+
+    invoice = make_valid_invoice()
+    empty_existing_invoices = []
+
+    def unexpected_database_call():
+        pytest.fail("get_all_invoices() should not have been called.")
+
+    monkeypatch.setattr(
+        pipeline,
+        "get_all_invoices",
+        unexpected_database_call,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "extract_text_from_pdf",
+        lambda pdf_path: "Extracted invoice text",
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "extract_invoice_data",
+        lambda invoice_text: invoice,
+    )
+
+    captured_invoices = {}
+
+    def mock_validate_invoice(invoice, existing):
+        captured_invoices["existing"] = existing
+        return []
+
+    monkeypatch.setattr(
+        pipeline,
+        "validate_invoice",
+        mock_validate_invoice,
+    )
+
+    pipeline.process_invoice(
+        "data/fictional_invoice.pdf",
+        existing_invoices=empty_existing_invoices,
+    )
+
+    assert captured_invoices["existing"] is empty_existing_invoices
+    assert captured_invoices["existing"] == []
+
+
+def test_valid_invoice_is_saved_once(monkeypatch):
+    """A successfully validated invoice should be saved exactly once."""
+
+    invoice = make_valid_invoice()
+    save_calls = []
+
+    monkeypatch.setattr(
+        pipeline,
+        "extract_invoice_data",
+        lambda text: invoice,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "save_invoice",
+        lambda invoice, source_file: save_calls.append(
+            (invoice, source_file)
+        ),
+    )
+
+    result = pipeline.process_invoice(
+        PDF_PATH,
+        existing_invoices=[],
+    )
+
+    assert result.success is True
+    assert len(save_calls) == 1
+
+
+def test_invalid_invoice_is_not_saved(monkeypatch):
+    """An invoice that fails validation should not be saved."""
+
+    invoice = make_valid_invoice().model_copy(
+        update={"total_amount": Decimal("570000.00")}
+    )
+
+    save_calls = []
+
+    monkeypatch.setattr(
+        pipeline,
+        "extract_invoice_data",
+        lambda text: invoice,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "save_invoice",
+        lambda invoice, source_file: save_calls.append(
+            (invoice, source_file)
+        ),
+    )
+
+    result = pipeline.process_invoice(
+        PDF_PATH,
+        existing_invoices=[],
+    )
+
+    assert result.success is False
+    assert result.errors
+    assert save_calls == []
+
+
+def test_duplicate_invoice_is_not_saved(monkeypatch):
+    """A duplicate invoice should fail validation and not be saved."""
+
+    invoice = make_valid_invoice()
+    existing_invoices = [make_valid_invoice()]
+
+    save_calls = []
+
+    monkeypatch.setattr(
+        pipeline,
+        "extract_invoice_data",
+        lambda text: invoice,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "save_invoice",
+        lambda invoice, source_file: save_calls.append(
+            (invoice, source_file)
+        ),
+    )
+
+    result = pipeline.process_invoice(
+        PDF_PATH,
+        existing_invoices=existing_invoices,
+    )
+
+    assert result.success is False
+    assert "Duplicate invoice detected." in result.errors
+    assert save_calls == []
+
+
+def test_save_invoice_receives_correct_invoice_and_pdf_path(
+    monkeypatch,
+):
+    """save_invoice should receive the extracted invoice and original PDF path."""
+
+    invoice = make_valid_invoice()
+    save_calls = []
+
+    def mock_save_invoice(saved_invoice, source_file):
+        save_calls.append((saved_invoice, source_file))
+        return 1
+
+    monkeypatch.setattr(
+        pipeline,
+        "extract_invoice_data",
+        lambda text: invoice,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "save_invoice",
+        mock_save_invoice,
+    )
+
+    pipeline.process_invoice(
+        PDF_PATH,
+        existing_invoices=[],
+    )
+
+    assert len(save_calls) == 1
+    assert save_calls[0][0] is invoice
+    assert save_calls[0][1] == PDF_PATH
+
+
+def test_explicit_existing_invoices_are_respected(
+    monkeypatch,
+):
+    """Explicitly supplied invoices should be used instead of database records."""
+
+    invoice = make_valid_invoice()
+    explicit_invoices = [
+        make_valid_invoice().model_copy(
+            update={"invoice_number": "INV-2026-2000"}
+        )
+    ]
+
+    captured = {}
+
+    def unexpected_database_call():
+        pytest.fail("Database retrieval should not occur.")
+
+    def mock_validate_invoice(invoice, existing_invoices):
+        captured["existing_invoices"] = existing_invoices
+        return []
+
+    monkeypatch.setattr(
+        pipeline,
+        "get_all_invoices",
+        unexpected_database_call,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "extract_invoice_data",
+        lambda text: invoice,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "validate_invoice",
+        mock_validate_invoice,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "save_invoice",
+        lambda invoice, source_file: 1,
+    )
+
+    result = pipeline.process_invoice(
+        PDF_PATH,
+        existing_invoices=explicit_invoices,
+    )
+
+    assert result.success is True
+    assert captured["existing_invoices"] is explicit_invoices
+
+
+def test_database_invoices_are_retrieved_when_existing_invoices_omitted(
+    monkeypatch,
+):
+    """The pipeline should retrieve and use stored invoices when none are supplied."""
+
+    invoice = make_valid_invoice()
+    database_invoices = [
+        make_valid_invoice().model_copy(
+            update={"invoice_number": "INV-2026-2000"}
+        )
+    ]
+
+    retrieval_calls = []
+    captured = {}
+
+    def mock_get_all_invoices():
+        retrieval_calls.append(True)
+        return database_invoices
+
+    def mock_validate_invoice(invoice, existing_invoices):
+        captured["existing_invoices"] = existing_invoices
+        return []
+
+    monkeypatch.setattr(
+        pipeline,
+        "get_all_invoices",
+        mock_get_all_invoices,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "extract_invoice_data",
+        lambda text: invoice,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "validate_invoice",
+        mock_validate_invoice,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "save_invoice",
+        lambda invoice, source_file: 1,
+    )
+
+    result = pipeline.process_invoice(PDF_PATH)
+
+    assert result.success is True
+    assert len(retrieval_calls) == 1
+    assert captured["existing_invoices"] is database_invoices
+
+
+def test_process_invoice_creates_quickbooks_draft(monkeypatch):
+    """A valid invoice should be transformed into a bill draft."""
+
+    invoice = make_valid_invoice()
+    saved_drafts = []
+
+    monkeypatch.setattr(
+        pipeline,
+        "extract_text_from_pdf",
+        lambda path: "invoice text",
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "extract_invoice_data",
+        lambda text: invoice,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "get_all_invoices",
+        lambda: [],
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "save_invoice",
+        lambda invoice, path: 1,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "save_quickbooks_draft",
+        lambda draft: saved_drafts.append(draft),
+    )
+
+    result = pipeline.process_invoice("invoice.pdf")
+
+    assert result.success is True
+    assert len(saved_drafts) == 1
+    assert saved_drafts[0].vendor_name == invoice.vendor_name
+    assert saved_drafts[0].bill_number == invoice.invoice_number
+    assert saved_drafts[0].status == "draft"
+
+
+def test_process_invoice_does_not_create_draft_when_invalid(monkeypatch):
+    """An invalid invoice must not produce an accounting draft."""
+
+    invoice = make_valid_invoice()
+    saved_drafts = []
+
+    monkeypatch.setattr(
+        pipeline,
+        "extract_text_from_pdf",
+        lambda path: "invoice text",
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "extract_invoice_data",
+        lambda text: invoice,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "get_all_invoices",
+        lambda: [invoice],
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "save_invoice",
+        lambda invoice, path: pytest.fail(
+            "Invalid invoices must not be saved."
+        ),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "save_quickbooks_draft",
+        lambda draft: saved_drafts.append(draft),
+    )
+
+    result = pipeline.process_invoice("invoice.pdf")
+
+    assert result.success is False
+    assert saved_drafts == []
+
+
+def test_process_invoice_saves_original_invoice_before_draft(
+    monkeypatch,
+):
+    """The original invoice should be saved before its draft."""
+
+    invoice = make_valid_invoice()
+    operations = []
+
+    monkeypatch.setattr(
+        pipeline,
+        "extract_text_from_pdf",
+        lambda path: "invoice text",
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "extract_invoice_data",
+        lambda text: invoice,
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "get_all_invoices",
+        lambda: [],
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "save_invoice",
+        lambda invoice, path: operations.append("invoice"),
+    )
+    monkeypatch.setattr(
+        pipeline,
+        "save_quickbooks_draft",
+        lambda draft: operations.append("draft"),
+    )
+
+    pipeline.process_invoice("invoice.pdf")
+
+    assert operations == ["invoice", "draft"]

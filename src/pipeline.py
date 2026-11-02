@@ -10,6 +10,8 @@ from src.pdf_extractor import extract_text_from_pdf
 from src.invoice_extractor import extract_invoice_data
 from src.validation import validate_invoice
 from src.schemas import InvoiceProcessingResult
+from src.storage import get_all_invoices, save_invoice, save_quickbooks_draft
+from src.quickbooks import create_bill_draft
 
 
 def process_invoice(pdf_path, existing_invoices=None):
@@ -26,20 +28,26 @@ def process_invoice(pdf_path, existing_invoices=None):
         invoice, validation status, errors, and source file.
     """
 
-    # 1. Use an empty list if no existing invoices are provided.
-    if existing_invoices is None:
-        existing_invoices = []
-
-    # 2. Extract text from the PDF.
+    # 1. Extract text from the PDF.
     invoice_text = extract_text_from_pdf(pdf_path)
 
-    # 3. Extract structured invoice data using AI.
+    # 2. Extract structured invoice data using AI.
     invoice = extract_invoice_data(invoice_text)
+
+    # 3. Retrieve existing invoices if none were supplied.
+    if existing_invoices is None:
+        existing_invoices = get_all_invoices()
 
     # 4. Validate the extracted invoice.
     errors = validate_invoice(invoice, existing_invoices)
 
-    # 5. Create and return the processing result.
+    # 5. Save the invoice and generate its accounting draft only if business validation succeeds.
+    if not errors:
+        save_invoice(invoice, pdf_path)
+        bill_draft = create_bill_draft(invoice)
+        save_quickbooks_draft(bill_draft)
+
+    # 6. Create and return the processing result.
     return InvoiceProcessingResult(
         success=len(errors) == 0,
         invoice=invoice,

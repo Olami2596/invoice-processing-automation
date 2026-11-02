@@ -25,7 +25,7 @@ def generate_with_ollama(prompt):
         method="POST",
     )
 
-    with urlopen(request, timeout=60) as response:
+    with urlopen(request, timeout=360) as response:
         response_bytes = response.read()
         response_text = response_bytes.decode("utf-8")
         response_data = json.loads(response_text)
