@@ -17,3 +17,5 @@ htmlcov/
 # Logs and generated data
 logs/
 outputs/
+
+test_invoice_extraction.py
