@@ -19,3 +19,9 @@ logs/
 outputs/
 
 test_invoice_extraction.py
+test_mailslurp_connection.py
+test_send_email.py
+test_retrieve_email.py
+test_email_ingestion.py
+
+data/
