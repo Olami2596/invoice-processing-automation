@@ -2,6 +2,7 @@
 from pathlib import Path
 from decimal import Decimal
 
+from src.logging_config import configure_logging
 from src.pipeline import process_invoice
 from src.storage import (
     initialise_database,
@@ -14,89 +15,111 @@ PDF_PATH = Path("data/new_fictional_invoice.pdf")
 
 
 def main():
-    initialise_database()
+    logger = configure_logging()
 
-    print("=" * 60)
-    print("INVOICE PROCESSING AUTOMATION")
-    print("=" * 60)
+    logger.info("Invoice processing application started")
 
-    if not PDF_PATH.exists():
-        raise FileNotFoundError(f"Invoice PDF not found: {PDF_PATH}")
+    try:
+        initialise_database()
 
-    result = process_invoice(PDF_PATH)
-    invoice = result.invoice
+        print("=" * 60)
+        print("INVOICE PROCESSING AUTOMATION")
+        print("=" * 60)
 
-    print("\nEXTRACTED INVOICE DETAILS")
-    print("-" * 60)
+        if not PDF_PATH.exists():
+            logger.error("Input invoice PDF is missing")
+            raise FileNotFoundError(
+                f"Invoice PDF not found: {PDF_PATH}"
+            )
 
-    print(f"Vendor: {invoice.vendor_name}")
-    print(f"Customer: {invoice.customer_name}")
-    print(f"Invoice number: {invoice.invoice_number}")
-    print(f"Invoice date: {invoice.invoice_date}")
-    print(f"Due date: {invoice.due_date}")
-    print(f"Currency: {invoice.currency}")
+        result = process_invoice(PDF_PATH)
+        invoice = result.invoice
 
-    print("\nLINE ITEMS")
+        print("\nEXTRACTED INVOICE DETAILS")
+        print("-" * 60)
 
-    for item in invoice.line_items:
-        expected_amount = item.quantity * item.unit_price
+        print(f"Vendor: {invoice.vendor_name}")
+        print(f"Customer: {invoice.customer_name}")
+        print(f"Invoice number: {invoice.invoice_number}")
+        print(f"Invoice date: {invoice.invoice_date}")
+        print(f"Due date: {invoice.due_date}")
+        print(f"Currency: {invoice.currency}")
 
-        print(f"\nDescription: {item.description}")
-        print(f"Quantity: {item.quantity}")
-        print(f"Unit price: {item.unit_price}")
-        print(f"Extracted amount: {item.amount}")
-        print(f"Expected amount: {expected_amount}")
+        print("\nLINE ITEMS")
 
-    calculated_subtotal = sum(
-        (item.amount for item in invoice.line_items),
-        Decimal("0"),
-    )
+        for item in invoice.line_items:
+            expected_amount = item.quantity * item.unit_price
 
-    print("\nFINANCIAL SUMMARY")
-    print("-" * 60)
-    print(f"Extracted subtotal: {invoice.subtotal}")
-    print(f"Calculated subtotal: {calculated_subtotal}")
-    print(f"Tax: {invoice.tax_amount}")
-    print(f"Total: {invoice.total_amount}")
+            print(f"\nDescription: {item.description}")
+            print(f"Quantity: {item.quantity}")
+            print(f"Unit price: {item.unit_price}")
+            print(f"Extracted amount: {item.amount}")
+            print(f"Expected amount: {expected_amount}")
 
-    if result.success:
-        print("\nInvoice processed successfully!")
+        calculated_subtotal = sum(
+            (item.amount for item in invoice.line_items),
+            Decimal("0"),
+        )
 
-        drafts = get_all_quickbooks_drafts()
+        print("\nFINANCIAL SUMMARY")
+        print("-" * 60)
+        print(f"Extracted subtotal: {invoice.subtotal}")
+        print(f"Calculated subtotal: {calculated_subtotal}")
+        print(f"Tax: {invoice.tax_amount}")
+        print(f"Total: {invoice.total_amount}")
 
-        matching_drafts = [
-            draft for draft in drafts
-            if draft.vendor_name == invoice.vendor_name
-            and draft.bill_number == invoice.invoice_number
-        ]
+        if result.success:
+            print("\nInvoice processed successfully!")
 
-        if matching_drafts:
-            draft = matching_drafts[0]
+            drafts = get_all_quickbooks_drafts()
 
-            print("\nQUICKBOOKS BILL DRAFT")
-            print("-" * 60)
-            print(f"Vendor: {draft.vendor_name}")
-            print(f"Bill number: {draft.bill_number}")
-            print(f"Bill date: {draft.bill_date}")
-            print(f"Subtotal: {draft.subtotal}")
-            print(f"Tax: {draft.tax_amount}")
-            print(f"Total: {draft.total_amount}")
-            print(f"Status: {draft.status}")
+            matching_drafts = [
+                draft for draft in drafts
+                if draft.vendor_name == invoice.vendor_name
+                and draft.bill_number == invoice.invoice_number
+            ]
+
+            if matching_drafts:
+                draft = matching_drafts[0]
+
+                print("\nQUICKBOOKS BILL DRAFT")
+                print("-" * 60)
+                print(f"Vendor: {draft.vendor_name}")
+                print(f"Bill number: {draft.bill_number}")
+                print(f"Bill date: {draft.bill_date}")
+                print(f"Subtotal: {draft.subtotal}")
+                print(f"Tax: {draft.tax_amount}")
+                print(f"Total: {draft.total_amount}")
+                print(f"Status: {draft.status}")
+            else:
+                print(
+                    "\nWARNING: No corresponding QuickBooks draft found."
+                )
+
         else:
-            print("\nWARNING: No corresponding QuickBooks draft found.")
+            print("\nInvoice processing failed.")
 
-    else:
-        print("\nInvoice processing failed.")
+            for error in result.errors:
+                print(f"- {error}")
 
-        for error in result.errors:
-            print(f"- {error}")
+        print("\nDATABASE SUMMARY")
+        print("-" * 60)
+        print(f"Stored invoices: {len(get_all_invoices())}")
+        print(
+            f"Stored QuickBooks drafts: "
+            f"{len(get_all_quickbooks_drafts())}"
+        )
 
-    print("\nDATABASE SUMMARY")
-    print("-" * 60)
-    print(f"Stored invoices: {len(get_all_invoices())}")
-    print(f"Stored QuickBooks drafts: {len(get_all_quickbooks_drafts())}")
+        print("\n" + "=" * 60)
 
-    print("\n" + "=" * 60)
+        logger.info("Invoice processing application finished")
+
+    except Exception as error:
+        logger.error(
+            "Invoice processing application terminated (%s)",
+            type(error).__name__,
+        )
+        raise
 
 
 if __name__ == "__main__":

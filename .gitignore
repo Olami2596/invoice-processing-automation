@@ -7,7 +7,7 @@ __pycache__/
 
 # Environment variables and secrets
 .env
-.env.*
+# .env.*
 
 # Test and coverage artifacts
 .pytest_cache/
@@ -17,11 +17,3 @@ htmlcov/
 # Logs and generated data
 logs/
 outputs/
-
-test_invoice_extraction.py
-test_mailslurp_connection.py
-test_send_email.py
-test_retrieve_email.py
-test_email_ingestion.py
-
-data/

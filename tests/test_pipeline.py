@@ -4,7 +4,7 @@ from decimal import Decimal
 from src import pipeline
 from src.schemas import Invoice, InvoiceProcessingResult
 from src.quickbooks import create_bill_draft
-
+from src.logging_config import configure_logging
 
 PDF_PATH = "data/fictional_invoice.pdf"
 
@@ -55,20 +55,24 @@ def isolate_pipeline_storage(monkeypatch):
         lambda: [],
     )
 
-    # Prevent tests from inserting records into the real invoice database.
     monkeypatch.setattr(
-        pipeline,
-        "save_invoice",
-        lambda invoice, source_file: 1,
+        pipeline.storage,
+        "save_invoice_and_quickbooks_draft",
+        lambda invoice, source_file, draft: (1, 1),
     )
 
-    # Prevent tests from inserting records into the real QuickBooks database.
-    monkeypatch.setattr(
-        pipeline,
-        "save_quickbooks_draft",
-        lambda draft: 1,
-    )
+@pytest.fixture
+def isolated_invoice_log(tmp_path):
+    """Create an isolated log file for pipeline logging tests."""
 
+    log_file = tmp_path / "processing.log"
+    logger = configure_logging(log_file=log_file)
+
+    yield logger, log_file
+
+    for handler in logger.handlers[:]:
+        logger.removeHandler(handler)
+        handler.close()
 
 def test_successfully_processed_invoice(monkeypatch):
     """Test that a valid invoice passes through the pipeline."""
@@ -616,7 +620,7 @@ def test_process_invoice_respects_explicit_empty_existing_invoices(
 
 
 def test_valid_invoice_is_saved_once(monkeypatch):
-    """A successfully validated invoice should be saved exactly once."""
+    """A successfully validated invoice should be saved atomically once."""
 
     invoice = make_valid_invoice()
     save_calls = []
@@ -626,11 +630,12 @@ def test_valid_invoice_is_saved_once(monkeypatch):
         "extract_invoice_data",
         lambda text: invoice,
     )
+
     monkeypatch.setattr(
-        pipeline,
-        "save_invoice",
-        lambda invoice, source_file: save_calls.append(
-            (invoice, source_file)
+        pipeline.storage,
+        "save_invoice_and_quickbooks_draft",
+        lambda invoice, source_file, draft: (
+            save_calls.append((invoice, source_file, draft)) or (1, 1)
         ),
     )
 
@@ -641,7 +646,6 @@ def test_valid_invoice_is_saved_once(monkeypatch):
 
     assert result.success is True
     assert len(save_calls) == 1
-
 
 def test_invalid_invoice_is_not_saved(monkeypatch):
     """An invoice that fails validation should not be saved."""
@@ -706,27 +710,26 @@ def test_duplicate_invoice_is_not_saved(monkeypatch):
     assert save_calls == []
 
 
-def test_save_invoice_receives_correct_invoice_and_pdf_path(
-    monkeypatch,
-):
-    """save_invoice should receive the extracted invoice and original PDF path."""
+def test_atomic_save_receives_correct_invoice_and_pdf_path(monkeypatch):
+    """Atomic storage should receive the extracted invoice and original PDF path."""
 
     invoice = make_valid_invoice()
     save_calls = []
 
-    def mock_save_invoice(saved_invoice, source_file):
-        save_calls.append((saved_invoice, source_file))
-        return 1
+    def mock_atomic_save(invoice, source_file, draft):
+        save_calls.append((invoice, source_file, draft))
+        return 1, 1
 
     monkeypatch.setattr(
         pipeline,
         "extract_invoice_data",
         lambda text: invoice,
     )
+
     monkeypatch.setattr(
-        pipeline,
-        "save_invoice",
-        mock_save_invoice,
+        pipeline.storage,
+        "save_invoice_and_quickbooks_draft",
+        mock_atomic_save,
     )
 
     pipeline.process_invoice(
@@ -737,7 +740,7 @@ def test_save_invoice_receives_correct_invoice_and_pdf_path(
     assert len(save_calls) == 1
     assert save_calls[0][0] is invoice
     assert save_calls[0][1] == PDF_PATH
-
+    assert save_calls[0][2].bill_number == invoice.invoice_number
 
 def test_explicit_existing_invoices_are_respected(
     monkeypatch,
@@ -842,7 +845,7 @@ def test_database_invoices_are_retrieved_when_existing_invoices_omitted(
 
 
 def test_process_invoice_creates_quickbooks_draft(monkeypatch):
-    """A valid invoice should be transformed into a bill draft."""
+    """A valid invoice should be transformed into a QuickBooks bill draft."""
 
     invoice = make_valid_invoice()
     saved_drafts = []
@@ -852,35 +855,33 @@ def test_process_invoice_creates_quickbooks_draft(monkeypatch):
         "extract_text_from_pdf",
         lambda path: "invoice text",
     )
+
     monkeypatch.setattr(
         pipeline,
         "extract_invoice_data",
         lambda text: invoice,
     )
+
+    def mock_atomic_save(invoice, source_file, draft):
+        saved_drafts.append(draft)
+        return 1, 1
+
     monkeypatch.setattr(
-        pipeline,
-        "get_all_invoices",
-        lambda: [],
-    )
-    monkeypatch.setattr(
-        pipeline,
-        "save_invoice",
-        lambda invoice, path: 1,
-    )
-    monkeypatch.setattr(
-        pipeline,
-        "save_quickbooks_draft",
-        lambda draft: saved_drafts.append(draft),
+        pipeline.storage,
+        "save_invoice_and_quickbooks_draft",
+        mock_atomic_save,
     )
 
-    result = pipeline.process_invoice("invoice.pdf")
+    result = pipeline.process_invoice(
+        "invoice.pdf",
+        existing_invoices=[],
+    )
 
     assert result.success is True
     assert len(saved_drafts) == 1
     assert saved_drafts[0].vendor_name == invoice.vendor_name
     assert saved_drafts[0].bill_number == invoice.invoice_number
     assert saved_drafts[0].status == "draft"
-
 
 def test_process_invoice_does_not_create_draft_when_invalid(monkeypatch):
     """An invalid invoice must not produce an accounting draft."""
@@ -922,10 +923,10 @@ def test_process_invoice_does_not_create_draft_when_invalid(monkeypatch):
     assert saved_drafts == []
 
 
-def test_process_invoice_saves_original_invoice_before_draft(
+def test_process_invoice_saves_invoice_and_draft_atomically(
     monkeypatch,
 ):
-    """The original invoice should be saved before its draft."""
+    """The invoice and its QuickBooks draft should be saved in one operation."""
 
     invoice = make_valid_invoice()
     operations = []
@@ -935,27 +936,686 @@ def test_process_invoice_saves_original_invoice_before_draft(
         "extract_text_from_pdf",
         lambda path: "invoice text",
     )
+
     monkeypatch.setattr(
         pipeline,
         "extract_invoice_data",
         lambda text: invoice,
     )
+
+    def mock_atomic_save(invoice, source_file, draft):
+        operations.append({
+            "invoice": invoice,
+            "source_file": source_file,
+            "draft": draft,
+        })
+        return 1, 1
+
     monkeypatch.setattr(
-        pipeline,
-        "get_all_invoices",
-        lambda: [],
-    )
-    monkeypatch.setattr(
-        pipeline,
-        "save_invoice",
-        lambda invoice, path: operations.append("invoice"),
-    )
-    monkeypatch.setattr(
-        pipeline,
-        "save_quickbooks_draft",
-        lambda draft: operations.append("draft"),
+        pipeline.storage,
+        "save_invoice_and_quickbooks_draft",
+        mock_atomic_save,
     )
 
-    pipeline.process_invoice("invoice.pdf")
+    pipeline.process_invoice(
+        "invoice.pdf",
+        existing_invoices=[],
+    )
 
-    assert operations == ["invoice", "draft"]
+    assert len(operations) == 1
+    assert operations[0]["invoice"] is invoice
+    assert operations[0]["source_file"] == "invoice.pdf"
+    assert operations[0]["draft"].bill_number == invoice.invoice_number
+
+def test_recent_email_is_marked_processed_after_all_pdfs_succeed(
+    monkeypatch,
+):
+    email = {
+        "message_id": "test-email-success-001",
+        "subject": "Invoice Submission",
+        "downloaded_files": [
+            "invoice_one.pdf",
+            "invoice_two.pdf",
+        ],
+    }
+
+    message_id = email["message_id"]
+
+    processed_files = []
+    marked_processed = []
+    marked_failed = []
+    marked_attachments_processed = []
+
+    attachment_records = [
+        {
+            "message_id": message_id,
+            "part_id": "part-one",
+            "filename": "invoice_one.pdf",
+            "file_path": "invoice_one.pdf",
+            "status": "downloaded",
+            "error_message": None,
+        },
+        {
+            "message_id": message_id,
+            "part_id": "part-two",
+            "filename": "invoice_two.pdf",
+            "file_path": "invoice_two.pdf",
+            "status": "downloaded",
+            "error_message": None,
+        },
+    ]
+
+    monkeypatch.setattr(
+        pipeline,
+        "ingest_recent_invoice_emails",
+        lambda **kwargs: [email],
+    )
+
+    def mock_process_invoice(pdf_path):
+        processed_files.append(str(pdf_path))
+
+        return InvoiceProcessingResult(
+            success=True,
+            invoice=make_valid_invoice(),
+            errors=[],
+            source_file=str(pdf_path),
+        )
+
+    monkeypatch.setattr(
+        pipeline,
+        "process_invoice",
+        mock_process_invoice,
+    )
+
+    monkeypatch.setattr(
+        pipeline.storage,
+        "get_email_attachments",
+        lambda message_id: attachment_records,
+    )
+
+    monkeypatch.setattr(
+        pipeline.storage,
+        "should_process_attachment",
+        lambda message_id, part_id: True,
+    )
+
+    def mock_mark_attachment_processed(message_id, part_id):
+        marked_attachments_processed.append((message_id, part_id))
+
+        for record in attachment_records:
+            if record["part_id"] == part_id:
+                record["status"] = "processed"
+
+    monkeypatch.setattr(
+        pipeline.storage,
+        "mark_attachment_processed",
+        mock_mark_attachment_processed,
+    )
+
+    monkeypatch.setattr(
+        pipeline.storage,
+        "mark_attachment_failed",
+        lambda message_id, part_id, error: pytest.fail(
+            "A successful attachment must not be marked failed."
+        ),
+    )
+
+    monkeypatch.setattr(
+        pipeline.storage,
+        "mark_email_processed",
+        lambda message_id: marked_processed.append(message_id),
+    )
+
+    monkeypatch.setattr(
+        pipeline.storage,
+        "mark_email_failed",
+        lambda message_id, error: marked_failed.append(message_id),
+    )
+
+    results = pipeline.process_recent_invoice_emails()
+
+    assert len(processed_files) == 2
+
+    assert results[0]["status"] == "processed"
+
+    assert results[0]["processed_files"] == [
+        "invoice_one.pdf",
+        "invoice_two.pdf",
+    ]
+
+    assert results[0]["skipped_files"] == []
+
+    assert marked_attachments_processed == [
+        (message_id, "part-one"),
+        (message_id, "part-two"),
+    ]
+
+    assert marked_processed == [message_id]
+    assert marked_failed == []
+
+def test_recent_email_is_marked_failed_when_invoice_validation_fails(
+    monkeypatch,
+):
+    email = {
+        "message_id": "test-email-failure-001",
+        "subject": "Invoice Submission",
+        "downloaded_files": ["invalid_invoice.pdf"],
+    }
+
+    marked_processed = []
+    marked_failed = []
+
+    monkeypatch.setattr(
+        pipeline,
+        "ingest_recent_invoice_emails",
+        lambda **kwargs: [email],
+    )
+
+    monkeypatch.setattr(
+        pipeline,
+        "process_invoice",
+        lambda pdf_path: InvoiceProcessingResult(
+            success=False,
+            invoice=make_valid_invoice(),
+            errors=["Invoice total does not match subtotal plus tax."],
+            source_file=str(pdf_path),
+        ),
+    )
+
+    monkeypatch.setattr(
+        pipeline.storage,
+        "mark_email_processed",
+        lambda message_id: marked_processed.append(message_id),
+    )
+
+    monkeypatch.setattr(
+        pipeline.storage,
+        "mark_email_failed",
+        lambda message_id, error, failure_type="transient": marked_failed.append(
+            (message_id, error, failure_type)
+        ),
+    )
+
+    results = pipeline.process_recent_invoice_emails()
+
+    assert results[0]["status"] == "failed"
+    assert results[0]["errors"]
+    assert marked_processed == []
+    assert marked_failed[0][0] == "test-email-failure-001"
+
+
+def test_recent_email_is_marked_failed_when_processing_raises_exception(
+    monkeypatch,
+):
+    email = {
+        "message_id": "test-email-exception-001",
+        "subject": "Invoice Submission",
+        "downloaded_files": ["invoice.pdf"],
+    }
+
+    message_id = email["message_id"]
+
+    marked_failed = []
+    marked_attachment_failed = []
+
+    attachment_records = [
+        {
+            "message_id": message_id,
+            "part_id": "exception-part",
+            "filename": "invoice.pdf",
+            "file_path": "invoice.pdf",
+            "status": "downloaded",
+            "error_message": None,
+        },
+    ]
+
+    monkeypatch.setattr(
+        pipeline,
+        "ingest_recent_invoice_emails",
+        lambda **kwargs: [email],
+    )
+
+    def mock_process_invoice(pdf_path):
+        raise RuntimeError("AI extraction service unavailable.")
+
+    monkeypatch.setattr(
+        pipeline,
+        "process_invoice",
+        mock_process_invoice,
+    )
+
+    monkeypatch.setattr(
+        pipeline.storage,
+        "get_email_attachments",
+        lambda message_id: attachment_records,
+    )
+
+    monkeypatch.setattr(
+        pipeline.storage,
+        "should_process_attachment",
+        lambda message_id, part_id: True,
+    )
+
+    def mock_mark_attachment_failed(
+        message_id,
+        part_id,
+        error,
+        failure_type="transient",
+    ):
+        marked_attachment_failed.append(
+            (message_id, part_id, error, failure_type)
+        )
+
+        for record in attachment_records:
+            if record["part_id"] == part_id:
+                record["status"] = "failed"
+                record["error_message"] = error
+                record["failure_type"] = failure_type
+                record["retry_count"] = record.get("retry_count", 0) + 1
+
+    monkeypatch.setattr(
+        pipeline.storage,
+        "mark_attachment_failed",
+        mock_mark_attachment_failed,
+    )
+
+    monkeypatch.setattr(
+        pipeline.storage,
+        "mark_attachment_processed",
+        lambda message_id, part_id: pytest.fail(
+            "A failed attachment must not be marked processed."
+        ),
+    )
+
+    monkeypatch.setattr(
+        pipeline.storage,
+        "mark_email_processed",
+        lambda message_id: pytest.fail(
+            "A failed email must not be marked processed."
+        ),
+    )
+
+    monkeypatch.setattr(
+        pipeline.storage,
+        "mark_email_failed",
+        lambda message_id, error, failure_type="transient": marked_failed.append(
+            (message_id, error, failure_type)
+        ),
+    )
+
+    results = pipeline.process_recent_invoice_emails()
+
+    assert results[0]["status"] == "failed"
+
+    assert (
+        "AI extraction service unavailable."
+        in results[0]["errors"][0]
+    )
+
+    assert len(marked_attachment_failed) == 1
+    assert marked_attachment_failed[0][0] == message_id
+    assert marked_attachment_failed[0][1] == "exception-part"
+
+    assert marked_failed[0][0] == message_id
+    assert (
+        "AI extraction service unavailable."
+        in marked_failed[0][1]
+    )
+
+
+def test_retry_skips_successful_attachments_and_retries_failed_one(
+    monkeypatch,
+):
+    message_id = "partial-failure-email-001"
+
+    email = {
+        "message_id": message_id,
+        "subject": "Invoice Submission",
+        "downloaded_files": [
+            "invoice_one.pdf",
+            "invoice_two.pdf",
+            "invoice_three.pdf",
+        ],
+    }
+
+    attachment_records = [
+        {
+            "message_id": message_id,
+            "part_id": "part-one",
+            "filename": "invoice_one.pdf",
+            "file_path": "invoice_one.pdf",
+            "status": "downloaded",
+            "error_message": None,
+        },
+        {
+            "message_id": message_id,
+            "part_id": "part-two",
+            "filename": "invoice_two.pdf",
+            "file_path": "invoice_two.pdf",
+            "status": "downloaded",
+            "error_message": None,
+        },
+        {
+            "message_id": message_id,
+            "part_id": "part-three",
+            "filename": "invoice_three.pdf",
+            "file_path": "invoice_three.pdf",
+            "status": "downloaded",
+            "error_message": None,
+        },
+    ]
+
+    process_attempts = []
+    marked_email_processed = []
+    marked_email_failed = []
+
+    # Simulate ingestion returning the same email on every attempt.
+    monkeypatch.setattr(
+        pipeline,
+        "ingest_recent_invoice_emails",
+        lambda **kwargs: [email],
+    )
+
+    monkeypatch.setattr(
+        pipeline.storage,
+        "get_email_attachments",
+        lambda message_id: attachment_records,
+    )
+
+    # An attachment can be processed unless it is already processed.
+    monkeypatch.setattr(
+        pipeline.storage,
+        "should_process_attachment",
+        lambda message_id, part_id: next(
+            record["status"] != "processed"
+            for record in attachment_records
+            if record["part_id"] == part_id
+        ),
+    )
+
+    def mock_process_invoice(pdf_path):
+        filename = str(pdf_path)
+        process_attempts.append(filename)
+
+        # Simulate an AI extraction failure on the third attachment
+        # during the first attempt only.
+        if (
+            filename == "invoice_three.pdf"
+            and process_attempts.count(filename) == 1
+        ):
+            raise RuntimeError("AI extraction service unavailable.")
+
+        return InvoiceProcessingResult(
+            success=True,
+            invoice=make_valid_invoice(),
+            errors=[],
+            source_file=filename,
+        )
+
+    monkeypatch.setattr(
+        pipeline,
+        "process_invoice",
+        mock_process_invoice,
+    )
+
+    def mock_mark_attachment_processed(message_id, part_id):
+        for record in attachment_records:
+            if record["part_id"] == part_id:
+                record["status"] = "processed"
+                record["error_message"] = None
+
+    monkeypatch.setattr(
+        pipeline.storage,
+        "mark_attachment_processed",
+        mock_mark_attachment_processed,
+    )
+
+    def mock_mark_attachment_failed(
+        message_id,
+        part_id,
+        error,
+        failure_type="transient",
+    ):
+        for record in attachment_records:
+            if record["part_id"] == part_id:
+                record["status"] = "failed"
+                record["error_message"] = error
+                record["failure_type"] = failure_type
+                record["retry_count"] = record.get("retry_count", 0) + 1
+
+    monkeypatch.setattr(
+        pipeline.storage,
+        "mark_attachment_failed",
+        mock_mark_attachment_failed,
+    )
+
+    monkeypatch.setattr(
+        pipeline.storage,
+        "mark_email_processed",
+        lambda message_id: marked_email_processed.append(message_id),
+    )
+
+    monkeypatch.setattr(
+        pipeline.storage,
+        "mark_email_failed",
+        lambda message_id, error, failure_type="transient": marked_email_failed.append(
+            (message_id, error, failure_type)
+        ),
+    )
+
+    # First attempt: two attachments succeed and the third fails.
+    first_results = pipeline.process_recent_invoice_emails()
+
+    assert first_results[0]["status"] == "failed"
+
+    assert first_results[0]["processed_files"] == [
+        "invoice_one.pdf",
+        "invoice_two.pdf",
+    ]
+
+    assert first_results[0]["skipped_files"] == []
+
+    assert [
+        record["status"] for record in attachment_records
+    ] == [
+        "processed",
+        "processed",
+        "failed",
+    ]
+
+    assert len(process_attempts) == 3
+
+    # Second attempt: only the previously failed attachment is retried.
+    second_results = pipeline.process_recent_invoice_emails()
+
+    assert second_results[0]["status"] == "processed"
+
+    assert second_results[0]["processed_files"] == [
+        "invoice_three.pdf",
+    ]
+
+    assert second_results[0]["skipped_files"] == [
+        "invoice_one.pdf",
+        "invoice_two.pdf",
+    ]
+
+    # The first two attachments must not have been processed again.
+    assert process_attempts == [
+        "invoice_one.pdf",
+        "invoice_two.pdf",
+        "invoice_three.pdf",
+        "invoice_three.pdf",
+    ]
+
+    assert [
+        record["status"] for record in attachment_records
+    ] == [
+        "processed",
+        "processed",
+        "processed",
+    ]
+
+    assert marked_email_processed == [message_id]
+
+    assert len(marked_email_failed) == 1
+    assert marked_email_failed[0][0] == message_id
+
+def test_process_invoice_saves_invoice_and_draft_atomically(
+    monkeypatch,
+):
+    calls = []
+
+    def mock_atomic_save(invoice, source_file, draft):
+        calls.append({
+            "invoice": invoice,
+            "source_file": source_file,
+            "draft": draft,
+        })
+        return 1, 1
+
+    monkeypatch.setattr(
+        pipeline.storage,
+        "save_invoice_and_quickbooks_draft",
+        mock_atomic_save,
+    )
+
+    # Keep the rest of this test consistent with your existing
+    # successful process_invoice test setup.
+
+def test_invoice_processing_logs_do_not_expose_invoice_details(
+    monkeypatch,
+    isolated_invoice_log,
+):
+    logger, log_file = isolated_invoice_log
+
+    invoice = make_valid_invoice()
+
+    sensitive_pdf_text = (
+        "PRIVATE_RAW_INVOICE_TEXT_12345"
+    )
+
+    monkeypatch.setattr(
+        pipeline,
+        "extract_text_from_pdf",
+        lambda path: sensitive_pdf_text,
+    )
+
+    monkeypatch.setattr(
+        pipeline,
+        "extract_invoice_data",
+        lambda text: invoice,
+    )
+
+    result = pipeline.process_invoice(
+        PDF_PATH,
+        existing_invoices=[],
+    )
+
+    assert result.success is True
+
+    for handler in logger.handlers:
+        handler.flush()
+
+    log_contents = log_file.read_text(encoding="utf-8")
+
+    # Expected operational messages should be present.
+    assert "Invoice processing started" in log_contents
+    assert "PDF text extraction completed" in log_contents
+    assert "AI invoice extraction completed" in log_contents
+    assert "Invoice validation passed" in log_contents
+    assert "saved successfully" in log_contents
+
+    # Sensitive invoice information must not appear.
+    assert sensitive_pdf_text not in log_contents
+    assert invoice.vendor_name not in log_contents
+    assert invoice.customer_name not in log_contents
+    assert invoice.invoice_number not in log_contents
+
+def test_email_processing_logs_do_not_expose_sensitive_details(
+    monkeypatch,
+    tmp_path,
+    isolated_invoice_log,
+):
+    logger, log_file = isolated_invoice_log
+
+    message_id = "PRIVATE_MESSAGE_ID_12345"
+    subject = "CONFIDENTIAL_EMAIL_SUBJECT"
+    attachment_path = tmp_path / "CONFIDENTIAL_INVOICE_PATH.pdf"
+    exception_message = "PRIVATE_EXCEPTION_DETAILS_98765"
+
+    email = {
+        "message_id": message_id,
+        "subject": subject,
+        "downloaded_files": [str(attachment_path)],
+    }
+
+    attachment_records = [
+        {
+            "message_id": message_id,
+            "part_id": "private-part-001",
+            "filename": "invoice.pdf",
+            "file_path": str(attachment_path),
+            "status": "downloaded",
+            "error_message": None,
+        }
+    ]
+
+    monkeypatch.setattr(
+        pipeline,
+        "ingest_recent_invoice_emails",
+        lambda **kwargs: [email],
+    )
+
+    monkeypatch.setattr(
+        pipeline.storage,
+        "get_email_attachments",
+        lambda message_id: attachment_records,
+    )
+
+    monkeypatch.setattr(
+        pipeline.storage,
+        "should_process_attachment",
+        lambda message_id, part_id: True,
+    )
+
+    def mock_process_invoice(pdf_path):
+        raise RuntimeError(exception_message)
+
+    monkeypatch.setattr(
+        pipeline,
+        "process_invoice",
+        mock_process_invoice,
+    )
+
+    monkeypatch.setattr(
+        pipeline.storage,
+        "mark_attachment_failed",
+        lambda *args, **kwargs: None,
+    )
+
+    monkeypatch.setattr(
+        pipeline.storage,
+        "mark_email_failed",
+        lambda *args, **kwargs: None,
+    )
+
+    results = pipeline.process_recent_invoice_emails()
+
+    assert results[0]["status"] == "failed"
+
+    for handler in logger.handlers:
+        handler.flush()
+
+    log_contents = log_file.read_text(encoding="utf-8")
+
+    # Operational information should be logged.
+    assert "Email ingestion completed" in log_contents
+    assert "Attachment processing failed" in log_contents
+    assert "RuntimeError" in log_contents
+
+    # Sensitive information must not appear.
+    assert message_id not in log_contents
+    assert subject not in log_contents
+    assert str(attachment_path) not in log_contents
+    assert exception_message not in log_contents
+
