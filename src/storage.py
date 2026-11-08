@@ -1440,13 +1440,16 @@ def claim_airtable_sync_job(job_id: int, lease_seconds: int = 120) -> str | None
     finally:
         connection.close()
 
+
 def get_pending_airtable_sync_jobs(
     limit: int = 100,
 ) -> list[dict]:
-    """Retrieve pending Airtable synchronization jobs."""
+    """Retrieve pending Airtable jobs that are available to be claimed."""
 
     if limit < 1:
         raise ValueError("limit must be greater than zero.")
+
+    now = datetime.now(timezone.utc).isoformat()
 
     connection = get_connection()
 
@@ -1458,15 +1461,19 @@ def get_pending_airtable_sync_jobs(
             SELECT *
             FROM airtable_sync
             WHERE status = 'pending'
+              AND (
+                  claim_token IS NULL
+                  OR claim_expires_at IS NULL
+                  OR claim_expires_at <= ?
+              )
             ORDER BY created_at ASC, id ASC
             LIMIT ?
-        """, (limit,))
+        """, (now, limit))
 
         return [dict(row) for row in cursor.fetchall()]
 
     finally:
         connection.close()
-
 
 
 def mark_airtable_sync_synced(

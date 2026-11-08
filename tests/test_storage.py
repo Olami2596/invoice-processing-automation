@@ -1330,6 +1330,96 @@ def test_get_pending_airtable_sync_jobs(test_db):
     assert all(job["status"] == "pending" for job in jobs)
 
 
+def test_get_pending_airtable_sync_jobs_excludes_active_claims(test_db):
+    """Jobs with active leases should not be returned."""
+
+    create_test_airtable_job()
+
+    jobs = storage.get_pending_airtable_sync_jobs()
+    assert len(jobs) == 2
+
+    claimed_job = jobs[0]
+
+    future_expiry = (
+        storage.datetime.now(storage.timezone.utc)
+        + storage.timedelta(minutes=5)
+    ).isoformat()
+
+    connection = storage.get_connection()
+
+    try:
+        connection.execute(
+            """
+            UPDATE airtable_sync
+            SET claim_token = ?,
+                claimed_at = ?,
+                claim_expires_at = ?
+            WHERE id = ?
+            """,
+            (
+                "active-test-token",
+                storage.datetime.now(storage.timezone.utc).isoformat(),
+                future_expiry,
+                claimed_job["id"],
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    available_jobs = storage.get_pending_airtable_sync_jobs()
+
+    assert len(available_jobs) == 1
+    assert available_jobs[0]["id"] != claimed_job["id"]
+
+
+def test_get_pending_airtable_sync_jobs_includes_expired_claims(test_db):
+    """Jobs with expired leases should be returned again."""
+
+    create_test_airtable_job()
+
+    jobs = storage.get_pending_airtable_sync_jobs()
+    assert len(jobs) == 2
+
+    expired_job = jobs[0]
+
+    past_expiry = (
+        storage.datetime.now(storage.timezone.utc)
+        - storage.timedelta(minutes=5)
+    ).isoformat()
+
+    connection = storage.get_connection()
+
+    try:
+        connection.execute(
+            """
+            UPDATE airtable_sync
+            SET claim_token = ?,
+                claimed_at = ?,
+                claim_expires_at = ?
+            WHERE id = ?
+            """,
+            (
+                "expired-test-token",
+                past_expiry,
+                past_expiry,
+                expired_job["id"],
+            ),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    available_jobs = storage.get_pending_airtable_sync_jobs()
+
+    available_job_ids = {
+        job["id"] for job in available_jobs
+    }
+
+    assert len(available_jobs) == 2
+    assert expired_job["id"] in available_job_ids
+
+
 def test_get_airtable_sync_job_returns_correct_record(test_db):
     """A queue job should be retrievable by its ID."""
 
