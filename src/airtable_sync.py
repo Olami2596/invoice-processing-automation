@@ -1,4 +1,3 @@
-
 import json
 import logging
 import os
@@ -22,9 +21,7 @@ class AirtableDuplicateRecordError(Exception):
 
 
 def get_airtable_table_config() -> dict[str, str]:
-    """
-    Load and validate Airtable table names from environment variables.
-    """
+    """Load and validate Airtable table names from environment variables."""
 
     load_dotenv()
 
@@ -52,12 +49,7 @@ def get_airtable_table_config() -> dict[str, str]:
 
 
 def decimal_to_number(value: Decimal | None) -> float | None:
-    """
-    Convert Decimal values into JSON-compatible numbers.
-
-    Airtable number fields expect numeric values rather than
-    Python Decimal objects.
-    """
+    """Convert Decimal values into JSON-compatible numbers."""
 
     if value is None:
         return None

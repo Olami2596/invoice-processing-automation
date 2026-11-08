@@ -44,11 +44,12 @@ def make_valid_invoice():
     )
 
 
+
 @pytest.fixture(autouse=True)
 def isolate_pipeline_storage(monkeypatch):
-    """Prevent pipeline tests from accessing the real invoice database."""
+    """Prevent pipeline tests from accessing real storage or Slack."""
 
-    # Return an empty database result by default.
+    # Isolate database operations.
     monkeypatch.setattr(
         pipeline,
         "get_all_invoices",
@@ -60,6 +61,26 @@ def isolate_pipeline_storage(monkeypatch):
         "save_invoice_and_quickbooks_draft",
         lambda invoice, source_file, draft: (1, 1),
     )
+
+    # Prevent tests from sending real Slack notifications.
+    monkeypatch.setattr(
+        pipeline,
+        "notify_invoice_processed",
+        lambda *args, **kwargs: None,
+    )
+
+    monkeypatch.setattr(
+        pipeline,
+        "notify_invoice_validation_failed",
+        lambda *args, **kwargs: None,
+    )
+
+    monkeypatch.setattr(
+        pipeline,
+        "notify_invoice_processing_failed",
+        lambda *args, **kwargs: None,
+    )
+
 
 @pytest.fixture
 def isolated_invoice_log(tmp_path):

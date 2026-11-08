@@ -1,4 +1,3 @@
-
 """
 Invoice processing pipeline.
 
@@ -24,9 +23,27 @@ from src.storage import (
     save_quickbooks_draft,
 )
 from src.validation import validate_invoice
-
+from src.notifications import (
+    notify_invoice_processed,
+    notify_invoice_validation_failed,
+    notify_invoice_processing_failed,
+)
 
 logger = logging.getLogger(LOGGER_NAME)
+
+
+def send_notification_safely(notification, **kwargs):
+    """
+    Send a notification without allowing notification failures
+    to interrupt invoice processing.
+    """
+    try:
+        notification(**kwargs)
+    except Exception as error:
+        logger.warning(
+            "Notification failed (%s)",
+            type(error).__name__,
+        )
 
 
 def classify_failure(error: Exception) -> str:
@@ -135,6 +152,11 @@ def process_invoice(pdf_path, existing_invoices=None):
             "Invoice validation failed: %d validation issue(s)",
             len(errors),
         )
+
+        send_notification_safely(
+            notify_invoice_validation_failed,
+            issue_count=len(errors),
+        )
     else:
         logger.info("Invoice validation passed")
 
@@ -150,6 +172,10 @@ def process_invoice(pdf_path, existing_invoices=None):
 
         logger.info(
             "Invoice and QuickBooks draft saved successfully"
+        )
+
+        send_notification_safely(
+            notify_invoice_processed,
         )
 
     # 6. Return the processing result.
@@ -212,8 +238,10 @@ def process_recent_invoice_emails(
             )
 
             # Map each saved PDF path to its attachment record.
+            # Resolve paths consistently to avoid mismatches
+            # caused by relative paths or different separators.
             records_by_path = {
-                str(Path(record["file_path"])): record
+                str(Path(record["file_path"]).resolve()): record
                 for record in attachment_records
                 if record["file_path"]
             }
@@ -221,7 +249,7 @@ def process_recent_invoice_emails(
             # 4. Process each downloaded PDF independently.
             for pdf_path in downloaded_files:
                 pdf_path = Path(pdf_path)
-                path_key = str(pdf_path)
+                path_key = str(pdf_path.resolve())
 
                 attachment = records_by_path.get(path_key)
 
@@ -294,8 +322,8 @@ def process_recent_invoice_emails(
                     # Classify unexpected processing failures.
                     failure_type = classify_failure(error)
 
-                    # Preserve the original error message for processing results
-                    # and database tracking.
+                    # Preserve the original error message for processing
+                    # results and database tracking.
                     error_message = str(error)
 
                     storage.mark_attachment_failed(
@@ -303,6 +331,11 @@ def process_recent_invoice_emails(
                         part_id,
                         error_message,
                         failure_type=failure_type,
+                    )
+
+                    send_notification_safely(
+                        notify_invoice_processing_failed,
+                        error_type=type(error).__name__,
                     )
 
                     # Keep application logs free from potentially sensitive

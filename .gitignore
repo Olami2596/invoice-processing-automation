@@ -1,4 +1,5 @@
-# Python environment
+
+# Python virtual environment
 .venv/
 
 # Python generated files
@@ -7,13 +8,31 @@ __pycache__/
 
 # Environment variables and secrets
 .env
-# .env.*
+.env.*
+!.env.example
 
 # Test and coverage artifacts
 .pytest_cache/
 .coverage
 htmlcov/
 
-# Logs and generated data
+# Logs
 logs/
-outputs/
+*.log
+
+# Local databases and backups
+data/*.db
+data/*.db-*
+data/*.sqlite
+data/*.sqlite3
+
+# Generated invoice PDFs
+data/INV-*.pdf
+data/new_fictional_invoice.pdf
+
+# Downloaded email attachments
+data/email_attachments/
+
+# Temporary files
+*.tmp
+*.bak

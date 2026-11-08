@@ -1,4 +1,5 @@
 import pytest
+from unittest.mock import Mock
 
 from src import airtable_worker
 from src.airtable_worker import classify_airtable_failure
@@ -11,7 +12,21 @@ from src.airtable_client import (
 )
 
 
-import pytest
+@pytest.fixture(autouse=True)
+def disable_real_slack_notifications(monkeypatch):
+    """Prevent worker tests from sending real Slack messages."""
+
+    monkeypatch.setattr(
+        airtable_worker,
+        "notify_airtable_sync_failed",
+        Mock(return_value=True),
+    )
+
+    monkeypatch.setattr(
+        airtable_worker,
+        "notify_airtable_sync_recovered",
+        Mock(return_value=True),
+    )
 
 
 @pytest.mark.parametrize(

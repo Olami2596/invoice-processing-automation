@@ -1377,7 +1377,7 @@ def get_airtable_sync_job(job_id: int) -> dict | None:
         connection.close()
 
 
-def claim_airtable_sync_job(job_id: int, lease_seconds: int = 120) -> str | None:
+def claim_airtable_sync_job(job_id: int, lease_seconds: int = 420) -> str | None:
     """
     Atomically claim a pending Airtable sync job.
 

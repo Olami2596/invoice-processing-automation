@@ -1,4 +1,3 @@
-
 import logging
 
 from src.airtable_client import (
@@ -11,12 +10,17 @@ from src.airtable_client import (
 )
 from src.airtable_sync import (
     AirtableSyncConfigurationError,
+    AirtableDuplicateRecordError,
     sync_invoice_to_airtable,
     sync_quickbooks_draft_to_airtable,
 )
 from src import storage
 from src.storage import MAX_AIRTABLE_RETRIES
 from src.logging_config import LOGGER_NAME
+from src.notifications import (
+    notify_airtable_sync_failed,
+    notify_airtable_sync_recovered,
+)
 
 logger = logging.getLogger(LOGGER_NAME)
 
@@ -29,6 +33,7 @@ def classify_airtable_failure(exc: Exception) -> str:
         AirtablePermissionError,
         AirtableNotFoundError,
         AirtableSyncConfigurationError,
+        AirtableDuplicateRecordError,
         ValueError,
         LookupError,
     )
@@ -89,6 +94,13 @@ def process_airtable_sync_job(
             "or is no longer available."
         )
         return False
+
+    # Remember whether this job has previously failed or been
+    # manually scheduled for retry. Used for recovery notifications.
+    was_retry = (
+        job.get("retry_count", 0) > 0
+        or bool(job.get("manual_retry", 0))
+    )
 
     try:
         # Client initialization remains inside the try block.
@@ -173,6 +185,34 @@ def process_airtable_sync_job(
                 failure_type=failure_type,
             )
 
+            updated_job = storage.get_airtable_sync_job(job_id)
+
+            retry_count = (
+                updated_job.get("retry_count", 0)
+                if updated_job
+                else 0
+            )
+
+            should_notify = (
+                failure_type == "permanent"
+                or retry_count >= MAX_AIRTABLE_RETRIES
+            )
+
+            if should_notify:
+                try:
+                    notify_airtable_sync_failed(
+                        job_id=job_id,
+                        entity_type=job["entity_type"],
+                        failure_type=failure_type,
+                        retry_count=retry_count,
+                        max_retries=MAX_AIRTABLE_RETRIES,
+                    )
+                except Exception as notification_error:
+                    logger.error(
+                        "Airtable failure notification failed (%s).",
+                        type(notification_error).__name__,
+                    )
+
         except (ValueError, LookupError):
             # Another worker may have reclaimed the job after the
             # original lease expired. Never let a stale worker change
@@ -203,6 +243,19 @@ def process_airtable_sync_job(
         return False
 
     logger.info("Airtable sync job completed successfully.")
+
+    if was_retry:
+        try:
+            notify_airtable_sync_recovered(
+                job_id=job_id,
+                entity_type=job["entity_type"],
+            )
+        except Exception as notification_error:
+            logger.error(
+                "Airtable recovery notification failed (%s).",
+                type(notification_error).__name__,
+            )
+
     return True
 
 

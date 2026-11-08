@@ -6,6 +6,21 @@ import pytest
 from src import airtable_worker
 from src.airtable_sync import AirtableSyncConfigurationError
 
+@pytest.fixture(autouse=True)
+def disable_real_slack_notifications(monkeypatch):
+    """Prevent configuration tests from sending real Slack messages."""
+
+    monkeypatch.setattr(
+        airtable_worker,
+        "notify_airtable_sync_failed",
+        Mock(return_value=True),
+    )
+
+    monkeypatch.setattr(
+        airtable_worker,
+        "notify_airtable_sync_recovered",
+        Mock(return_value=True),
+    )
 
 def test_configuration_error_is_permanent():
     exc = AirtableSyncConfigurationError(
