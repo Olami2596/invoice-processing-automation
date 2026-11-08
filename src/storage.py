@@ -1,4 +1,5 @@
 import json
+import uuid
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
@@ -306,6 +307,10 @@ def create_airtable_sync_table() -> None:
 
                 manual_retry INTEGER NOT NULL DEFAULT 0
                     CHECK (manual_retry IN (0, 1)),
+
+                claim_token TEXT,
+                claimed_at TEXT,
+                claim_expires_at TEXT,
 
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 
@@ -1318,6 +1323,24 @@ def migrate_retry_tracking_columns():
                         ADD COLUMN manual_retry INTEGER NOT NULL DEFAULT 0
                     """)
 
+                if "claim_token" not in existing_columns:
+                    cursor.execute("""
+                        ALTER TABLE airtable_sync
+                        ADD COLUMN claim_token TEXT
+                    """)
+
+                if "claimed_at" not in existing_columns:
+                    cursor.execute("""
+                        ALTER TABLE airtable_sync
+                        ADD COLUMN claimed_at TEXT
+                    """)
+
+                if "claim_expires_at" not in existing_columns:
+                    cursor.execute("""
+                        ALTER TABLE airtable_sync
+                        ADD COLUMN claim_expires_at TEXT
+                    """)
+
         connection.commit()
 
     except Exception:
@@ -1354,6 +1377,69 @@ def get_airtable_sync_job(job_id: int) -> dict | None:
         connection.close()
 
 
+def claim_airtable_sync_job(job_id: int, lease_seconds: int = 120) -> str | None:
+    """
+    Atomically claim a pending Airtable sync job.
+
+    Returns a unique claim token if successful.
+    Returns None if the job does not exist, is not pending,
+    or is currently claimed by another worker.
+    """
+    if lease_seconds <= 0:
+        raise ValueError("lease_seconds must be greater than zero.")
+
+    claim_token = uuid.uuid4().hex
+
+    now = datetime.now(timezone.utc)
+    claimed_at = now.isoformat()
+    claim_expires_at = (
+        now + timedelta(seconds=lease_seconds)
+    ).isoformat()
+
+    connection = get_connection()
+
+    try:
+        connection.execute("BEGIN IMMEDIATE")
+
+        cursor = connection.execute(
+            """
+            UPDATE airtable_sync
+            SET
+                claim_token = ?,
+                claimed_at = ?,
+                claim_expires_at = ?,
+                updated_at = CURRENT_TIMESTAMP
+            WHERE id = ?
+              AND status = 'pending'
+              AND (
+                  claim_token IS NULL
+                  OR claim_expires_at IS NULL
+                  OR claim_expires_at <= ?
+              )
+            """,
+            (
+                claim_token,
+                claimed_at,
+                claim_expires_at,
+                job_id,
+                claimed_at,
+            ),
+        )
+
+        if cursor.rowcount != 1:
+            connection.rollback()
+            return None
+
+        connection.commit()
+        return claim_token
+
+    except Exception:
+        connection.rollback()
+        raise
+
+    finally:
+        connection.close()
+
 def get_pending_airtable_sync_jobs(
     limit: int = 100,
 ) -> list[dict]:
@@ -1382,24 +1468,61 @@ def get_pending_airtable_sync_jobs(
         connection.close()
 
 
+
 def mark_airtable_sync_synced(
     job_id: int,
     airtable_record_id: str,
+    claim_token: str,
 ) -> None:
-    """Mark a pending job as synced and store its Airtable record ID."""
+    """Mark an Airtable sync job as successful using its active claim."""
 
     if job_id <= 0:
-        raise ValueError("job_id must be positive.")
+        raise ValueError("job_id must be a positive integer.")
 
     if not airtable_record_id or not airtable_record_id.strip():
         raise ValueError("airtable_record_id cannot be empty.")
+
+    if not claim_token or not claim_token.strip():
+        raise ValueError("claim_token cannot be empty.")
 
     connection = get_connection()
 
     try:
         cursor = connection.cursor()
 
-        cursor.execute("""
+        connection.execute("BEGIN IMMEDIATE")
+
+        # Check whether the job already exists and whether it was
+        # successfully synced with this exact Airtable record ID.
+        cursor.execute(
+            """
+            SELECT status, airtable_record_id
+            FROM airtable_sync
+            WHERE id = ?
+            """,
+            (job_id,),
+        )
+
+        record = cursor.fetchone()
+
+        if record is None:
+            raise LookupError(
+                f"Airtable sync job {job_id} does not exist."
+            )
+
+        # Preserve idempotency: repeating the same successful operation
+        # should not cause an error.
+        if (
+            record[0] == "synced"
+            and record[1] == airtable_record_id
+        ):
+            connection.commit()
+            return
+
+        current_time = datetime.now(timezone.utc).isoformat()
+
+        cursor.execute(
+            """
             UPDATE airtable_sync
             SET
                 status = 'synced',
@@ -1408,27 +1531,28 @@ def mark_airtable_sync_synced(
                 failure_type = NULL,
                 next_retry_at = NULL,
                 manual_retry = 0,
+                claim_token = NULL,
+                claimed_at = NULL,
+                claim_expires_at = NULL,
                 updated_at = CURRENT_TIMESTAMP
-            WHERE id = ?
-              AND status = 'pending'
-        """, (airtable_record_id, job_id))
+            WHERE
+                id = ?
+                AND status = 'pending'
+                AND claim_token = ?
+                AND claim_expires_at > ?
+            """,
+            (
+                airtable_record_id,
+                job_id,
+                claim_token,
+                current_time,
+            ),
+        )
 
-        if cursor.rowcount == 0:
-            record = get_airtable_sync_job(job_id)
-
-            if record is None:
-                raise LookupError(
-                    f"Airtable sync job not found: {job_id}"
-                )
-
-            if (
-                record["status"] == "synced"
-                and record["airtable_record_id"] == airtable_record_id
-            ):
-                return
-
+        if cursor.rowcount != 1:
             raise ValueError(
-                "Only pending jobs can be marked as synced."
+                "Job cannot be marked as synced: "
+                "claim is missing, expired, or no longer valid."
             )
 
         connection.commit()
@@ -1441,13 +1565,15 @@ def mark_airtable_sync_synced(
         connection.close()
 
 
+
 def mark_airtable_sync_failed(
     job_id: int,
     error_message: str,
+    claim_token: str,
     failure_type: str = "transient",
 ) -> None:
     """
-    Mark a pending Airtable job as failed.
+    Mark a claimed Airtable job as failed.
 
     Transient failures receive an exponential backoff schedule.
     Permanent failures are never automatically retried.
@@ -1459,21 +1585,34 @@ def mark_airtable_sync_failed(
     if not error_message or not error_message.strip():
         raise ValueError("error_message cannot be empty.")
 
+    if not claim_token or not claim_token.strip():
+        raise ValueError("claim_token cannot be empty.")
+
     if failure_type not in {"transient", "permanent"}:
         raise ValueError(
             "failure_type must be 'transient' or 'permanent'."
         )
 
+    now = datetime.now(timezone.utc).isoformat()
+
     connection = get_connection()
 
     try:
+        connection.execute("BEGIN IMMEDIATE")
+
         cursor = connection.cursor()
 
-        cursor.execute("""
+        cursor.execute(
+            """
             SELECT retry_count
             FROM airtable_sync
-            WHERE id = ? AND status = 'pending'
-        """, (job_id,))
+            WHERE id = ?
+              AND status = 'pending'
+              AND claim_token = ?
+              AND claim_expires_at > ?
+            """,
+            (job_id, claim_token, now),
+        )
 
         record = cursor.fetchone()
 
@@ -1486,7 +1625,8 @@ def mark_airtable_sync_failed(
                 )
 
             raise ValueError(
-                "Only pending jobs can be marked as failed."
+                "Job cannot be marked as failed: "
+                "claim is missing, expired, or no longer valid."
             )
 
         next_retry_count = record[0] + 1
@@ -1503,7 +1643,8 @@ def mark_airtable_sync_failed(
                 + timedelta(minutes=delay_minutes)
             ).isoformat()
 
-        cursor.execute("""
+        cursor.execute(
+            """
             UPDATE airtable_sync
             SET
                 status = 'failed',
@@ -1512,16 +1653,30 @@ def mark_airtable_sync_failed(
                 retry_count = ?,
                 next_retry_at = ?,
                 manual_retry = 0,
+                claim_token = NULL,
+                claimed_at = NULL,
+                claim_expires_at = NULL,
                 updated_at = CURRENT_TIMESTAMP
             WHERE id = ?
               AND status = 'pending'
-        """, (
-            error_message,
-            failure_type,
-            next_retry_count,
-            next_retry_at,
-            job_id,
-        ))
+              AND claim_token = ?
+              AND claim_expires_at > ?
+            """,
+            (
+                error_message,
+                failure_type,
+                next_retry_count,
+                next_retry_at,
+                job_id,
+                claim_token,
+                now,
+            ),
+        )
+
+        if cursor.rowcount != 1:
+            raise ValueError(
+                "Job claim became invalid before failure could be recorded."
+            )
 
         connection.commit()
 
@@ -1531,6 +1686,7 @@ def mark_airtable_sync_failed(
 
     finally:
         connection.close()
+
 
 def mark_airtable_sync_pending(job_id: int) -> None:
     """Manually reset a failed job while preserving its retry history."""

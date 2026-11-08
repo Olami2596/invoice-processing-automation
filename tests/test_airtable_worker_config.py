@@ -27,6 +27,7 @@ def test_unexpected_error_is_transient():
     assert airtable_worker.classify_airtable_failure(exc) == "transient"
 
 
+
 def test_configuration_error_marks_job_as_permanently_failed(
     monkeypatch,
 ):
@@ -43,6 +44,12 @@ def test_configuration_error_marks_job_as_permanently_failed(
         airtable_worker.storage,
         "get_airtable_sync_job",
         lambda job_id: job,
+    )
+
+    monkeypatch.setattr(
+        airtable_worker.storage,
+        "claim_airtable_sync_job",
+        lambda job_id: "test-claim-token",
     )
 
     monkeypatch.setattr(
@@ -73,8 +80,10 @@ def test_configuration_error_marks_job_as_permanently_failed(
             "Airtable synchronization failed "
             "(AirtableSyncConfigurationError)."
         ),
+        claim_token="test-claim-token",
         failure_type="permanent",
     )
+
 
 
 def test_client_initialization_error_does_not_escape_worker(
@@ -96,6 +105,12 @@ def test_client_initialization_error_does_not_escape_worker(
     )
 
     monkeypatch.setattr(
+        airtable_worker.storage,
+        "claim_airtable_sync_job",
+        lambda job_id: "test-claim-token",
+    )
+
+    monkeypatch.setattr(
         airtable_worker,
         "AirtableClient",
         Mock(side_effect=ValueError("Missing Airtable credentials.")),
@@ -113,4 +128,11 @@ def test_client_initialization_error_does_not_escape_worker(
 
     assert result is False
 
-    assert mark_failed.call_args.kwargs["failure_type"] == "permanent"
+    mark_failed.assert_called_once_with(
+        job_id=11,
+        error_message=(
+            "Airtable synchronization failed (ValueError)."
+        ),
+        claim_token="test-claim-token",
+        failure_type="permanent",
+    )

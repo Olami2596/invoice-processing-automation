@@ -80,6 +80,12 @@ def test_process_airtable_sync_job_successful_invoice(monkeypatch):
 
     monkeypatch.setattr(
         airtable_worker.storage,
+        "claim_airtable_sync_job",
+        lambda requested_job_id: "test-claim-token",
+    )
+
+    monkeypatch.setattr(
+        airtable_worker.storage,
         "get_invoice_by_id",
         lambda invoice_id: (invoice, source_file),
     )
@@ -112,10 +118,10 @@ def test_process_airtable_sync_job_successful_invoice(monkeypatch):
     )
 
     assert result is True
-    assert synced == {
-        "job_id": 1,
-        "airtable_record_id": "recINVOICE123",
-    }
+
+    assert synced["job_id"] == 1
+    assert synced["airtable_record_id"] == "recINVOICE123"
+    assert synced["claim_token"] == "test-claim-token"
 
 
 def test_process_airtable_sync_job_successful_draft(monkeypatch):
@@ -135,6 +141,12 @@ def test_process_airtable_sync_job_successful_draft(monkeypatch):
         airtable_worker.storage,
         "get_airtable_sync_job",
         lambda job_id: job,
+    )
+
+    monkeypatch.setattr(
+        airtable_worker.storage,
+        "claim_airtable_sync_job",
+        lambda requested_job_id: "test-claim-token",
     )
 
     monkeypatch.setattr(
@@ -249,6 +261,12 @@ def test_process_airtable_sync_job_missing_invoice(monkeypatch):
 
     monkeypatch.setattr(
         airtable_worker.storage,
+        "claim_airtable_sync_job",
+        lambda requested_job_id: "test-claim-token",
+    )
+
+    monkeypatch.setattr(
+        airtable_worker.storage,
         "get_invoice_by_id",
         lambda invoice_id: None,
     )
@@ -285,6 +303,12 @@ def test_process_airtable_sync_job_handles_airtable_failure(monkeypatch):
         airtable_worker.storage,
         "get_airtable_sync_job",
         lambda job_id: job,
+    )
+
+    monkeypatch.setattr(
+        airtable_worker.storage,
+        "claim_airtable_sync_job",
+        lambda requested_job_id: "test-claim-token",
     )
 
     monkeypatch.setattr(

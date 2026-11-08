@@ -640,6 +640,9 @@ def test_airtable_sync_table_has_expected_columns(test_db):
             "status",
             "retry_count",
             "error_message",
+            "claim_token",
+            "claimed_at",
+            "claim_expires_at",
             "created_at",
             "updated_at",
         }
@@ -1339,14 +1342,98 @@ def test_get_airtable_sync_job_returns_correct_record(test_db):
     assert retrieved["entity_type"] == "invoice"
 
 
+def test_claim_airtable_sync_job_success(test_db):
+    """A pending job should be claimed successfully."""
+
+    job = create_test_airtable_job()
+
+    claim_token = storage.claim_airtable_sync_job(job["id"])
+
+    assert isinstance(claim_token, str)
+    assert len(claim_token) == 32
+
+    updated = storage.get_airtable_sync_job(job["id"])
+
+    assert updated["claim_token"] == claim_token
+    assert updated["claimed_at"] is not None
+    assert updated["claim_expires_at"] is not None
+
+
+def test_claim_airtable_sync_job_prevents_second_claim(test_db):
+    """A job with an active lease cannot be claimed again."""
+
+    job = create_test_airtable_job()
+
+    first_token = storage.claim_airtable_sync_job(job["id"])
+    second_token = storage.claim_airtable_sync_job(job["id"])
+
+    assert first_token is not None
+    assert second_token is None
+
+
+def test_claim_airtable_sync_job_allows_reclaim_after_expiry(test_db):
+    """An expired lease should allow another worker to claim the job."""
+
+    job = create_test_airtable_job()
+
+    first_token = storage.claim_airtable_sync_job(job["id"])
+
+    connection = storage.get_connection()
+
+    try:
+        connection.execute(
+            """
+            UPDATE airtable_sync
+            SET claim_expires_at = ?
+            WHERE id = ?
+            """,
+            ("2000-01-01T00:00:00+00:00", job["id"]),
+        )
+        connection.commit()
+    finally:
+        connection.close()
+
+    second_token = storage.claim_airtable_sync_job(job["id"])
+
+    assert first_token is not None
+    assert second_token is not None
+    assert second_token != first_token
+
+    updated = storage.get_airtable_sync_job(job["id"])
+
+    assert updated["claim_token"] == second_token
+
+
+def test_claim_airtable_sync_job_returns_none_for_unknown_job(test_db):
+    """An unknown job cannot be claimed."""
+
+    result = storage.claim_airtable_sync_job(9999)
+
+    assert result is None
+
+
+def test_claim_airtable_sync_job_rejects_invalid_lease(test_db):
+    """Lease duration must be positive."""
+
+    job = create_test_airtable_job()
+
+    with pytest.raises(ValueError):
+        storage.claim_airtable_sync_job(job["id"], lease_seconds=0)
+
+    with pytest.raises(ValueError):
+        storage.claim_airtable_sync_job(job["id"], lease_seconds=-10)
+
+
 def test_mark_airtable_sync_synced(test_db):
     """Successful synchronization should store the Airtable record ID."""
 
     job = create_test_airtable_job()
+    claim_token = storage.claim_airtable_sync_job(job["id"])
 
     storage.mark_airtable_sync_synced(
         job["id"],
         "recTest123",
+        claim_token,
     )
 
     updated = storage.get_airtable_sync_job(job["id"])
@@ -1354,37 +1441,46 @@ def test_mark_airtable_sync_synced(test_db):
     assert updated["status"] == "synced"
     assert updated["airtable_record_id"] == "recTest123"
     assert updated["error_message"] is None
+    assert updated["claim_token"] is None
+    assert updated["claimed_at"] is None
+    assert updated["claim_expires_at"] is None
 
 
 def test_mark_airtable_sync_synced_is_idempotent(test_db):
-    """Repeating the same successful update should be safe."""
-
     job = create_test_airtable_job()
+    job_id = job["id"]
+
+    claim_token = storage.claim_airtable_sync_job(job_id)
 
     storage.mark_airtable_sync_synced(
-        job["id"],
-        "recTest123",
+        job_id,
+        "rec123",
+        claim_token,
     )
 
+    # Repeating the same operation should not raise an error.
     storage.mark_airtable_sync_synced(
-        job["id"],
-        "recTest123",
+        job_id,
+        "rec123",
+        claim_token,
     )
 
-    updated = storage.get_airtable_sync_job(job["id"])
+    result = storage.get_airtable_sync_job(job_id)
 
-    assert updated["status"] == "synced"
-    assert updated["airtable_record_id"] == "recTest123"
+    assert result["status"] == "synced"
+    assert result["airtable_record_id"] == "rec123"
 
 
 def test_mark_airtable_sync_failed_increments_retry_count(test_db):
     """A failed synchronization should increment retry_count."""
 
     job = create_test_airtable_job()
+    claim_token = storage.claim_airtable_sync_job(job["id"])
 
     storage.mark_airtable_sync_failed(
         job["id"],
         "Temporary Airtable connection failure.",
+        claim_token,
     )
 
     updated = storage.get_airtable_sync_job(job["id"])
@@ -1394,6 +1490,8 @@ def test_mark_airtable_sync_failed_increments_retry_count(test_db):
     assert updated["error_message"] == (
         "Temporary Airtable connection failure."
     )
+    assert updated["claim_token"] is None
+    assert updated["claim_expires_at"] is None
 
 
 def test_mark_airtable_sync_pending_preserves_retry_count(test_db):
@@ -1401,9 +1499,12 @@ def test_mark_airtable_sync_pending_preserves_retry_count(test_db):
 
     job = create_test_airtable_job()
 
+    claim_token = storage.claim_airtable_sync_job(job["id"])
+
     storage.mark_airtable_sync_failed(
         job["id"],
         "Temporary failure.",
+        claim_token,
     )
 
     storage.mark_airtable_sync_pending(job["id"])
@@ -1420,9 +1521,12 @@ def test_failed_jobs_are_excluded_from_pending_queue(test_db):
 
     job = create_test_airtable_job()
 
+    claim_token = storage.claim_airtable_sync_job(job["id"])
+
     storage.mark_airtable_sync_failed(
         job["id"],
         "Temporary failure.",
+        claim_token,
     )
 
     pending_jobs = storage.get_pending_airtable_sync_jobs()
@@ -1438,6 +1542,7 @@ def test_mark_unknown_airtable_job_synced_raises_error(test_db):
         storage.mark_airtable_sync_synced(
             9999,
             "recUnknown",
+            "test-claim-token",
         )
 
 
@@ -1446,6 +1551,7 @@ def test_mark_unknown_airtable_job_failed_raises_error(test_db):
         storage.mark_airtable_sync_failed(
             9999,
             "Temporary failure.",
+            "test-claim-token",
         )
 
 
@@ -1525,6 +1631,9 @@ def test_airtable_sync_table_has_retry_columns(test_db):
 
         assert "failure_type" in columns
         assert "next_retry_at" in columns
+        assert "claim_token" in columns
+        assert "claimed_at" in columns
+        assert "claim_expires_at" in columns
 
     finally:
         connection.close()
@@ -1564,6 +1673,9 @@ def test_airtable_retry_migration_preserves_existing_job(test_db):
     assert job["error_message"] == "Previous failure"
     assert job["failure_type"] is None
     assert job["next_retry_at"] is None
+    assert job["claim_token"] is None
+    assert job["claimed_at"] is None
+    assert job["claim_expires_at"] is None
 
 
 def test_airtable_transient_failure_schedules_first_retry(test_db):
@@ -1589,11 +1701,13 @@ def test_airtable_transient_failure_schedules_first_retry(test_db):
     finally:
         connection.close()
 
+    claim_token = storage.claim_airtable_sync_job(job_id)
     before = datetime.now(timezone.utc)
 
     storage.mark_airtable_sync_failed(
         job_id,
         "Temporary API failure",
+        claim_token,
         failure_type="transient",
     )
 
@@ -1634,11 +1748,13 @@ def test_airtable_second_failure_schedules_two_minutes(test_db):
     finally:
         connection.close()
 
+    claim_token = storage.claim_airtable_sync_job(job_id)
     before = datetime.now(timezone.utc)
 
     storage.mark_airtable_sync_failed(
         job_id,
         "Temporary API failure",
+        claim_token,
         failure_type="transient",
     )
 
@@ -1674,9 +1790,12 @@ def test_airtable_permanent_failure_has_no_retry(test_db):
     finally:
         connection.close()
 
+    claim_token = storage.claim_airtable_sync_job(job_id)
+
     storage.mark_airtable_sync_failed(
         job_id,
         "Invalid Airtable field configuration",
+        claim_token,
         failure_type="permanent",
     )
 
@@ -1709,9 +1828,12 @@ def test_airtable_fifth_failure_exhausts_retries(test_db):
     finally:
         connection.close()
 
+    claim_token = storage.claim_airtable_sync_job(job_id)
+
     storage.mark_airtable_sync_failed(
         job_id,
         "Temporary API failure",
+        claim_token,
         failure_type="transient",
     )
 

@@ -45,8 +45,10 @@ def classify_airtable_failure(exc: Exception) -> str:
         if exc.status_code is not None:
             if exc.status_code in (408, 425) or exc.status_code >= 500:
                 return "transient"
+
             if 400 <= exc.status_code < 500:
                 return "permanent"
+
         return "transient"
 
     return "transient"
@@ -56,7 +58,7 @@ def process_airtable_sync_job(
     job_id: int,
     client: AirtableClient | None = None,
 ) -> bool:
-    """Process one pending Airtable synchronization job."""
+    """Process one pending Airtable synchronization job using a lease."""
 
     job = storage.get_airtable_sync_job(job_id)
 
@@ -64,7 +66,9 @@ def process_airtable_sync_job(
         raise LookupError(f"Airtable sync job {job_id} does not exist.")
 
     if job["status"] != "pending":
-        logger.info("Airtable sync job skipped because it is not pending.")
+        logger.info(
+            "Airtable sync job skipped because it is not pending."
+        )
         return False
 
     if (
@@ -76,10 +80,20 @@ def process_airtable_sync_job(
         )
         return False
 
+    # Atomically claim the job before doing any external work.
+    claim_token = storage.claim_airtable_sync_job(job_id)
+
+    if claim_token is None:
+        logger.info(
+            "Airtable sync job skipped because it is already claimed "
+            "or is no longer available."
+        )
+        return False
+
     try:
-        # Client initialization is deliberately inside the try block.
+        # Client initialization remains inside the try block.
         # Configuration and connection errors must be recorded against
-        # the job rather than crashing the worker.
+        # the claimed job rather than crashing the worker.
         if client is None:
             client = AirtableClient()
 
@@ -114,10 +128,14 @@ def process_airtable_sync_job(
             )
 
         else:
-            raise ValueError("Unsupported Airtable sync entity type.")
+            raise ValueError(
+                "Unsupported Airtable sync entity type."
+            )
 
         if not isinstance(airtable_record, dict):
-            raise ValueError("Airtable response is not a valid record object.")
+            raise ValueError(
+                "Airtable response is not a valid record object."
+            )
 
         airtable_record_id = airtable_record.get("id")
 
@@ -128,14 +146,6 @@ def process_airtable_sync_job(
             raise ValueError(
                 "Airtable response does not contain a valid record ID."
             )
-
-        storage.mark_airtable_sync_synced(
-            job_id=job_id,
-            airtable_record_id=airtable_record_id,
-        )
-
-        logger.info("Airtable sync job completed successfully.")
-        return True
 
     except Exception as exc:
         failure_type = classify_airtable_failure(exc)
@@ -152,27 +162,62 @@ def process_airtable_sync_job(
             failure_type,
         )
 
-        storage.mark_airtable_sync_failed(
-            job_id=job_id,
-            error_message=(
-                f"Airtable synchronization failed ({type(exc).__name__})."
-            ),
-            failure_type=failure_type,
-        )
+        try:
+            storage.mark_airtable_sync_failed(
+                job_id=job_id,
+                error_message=(
+                    f"Airtable synchronization failed "
+                    f"({type(exc).__name__})."
+                ),
+                claim_token=claim_token,
+                failure_type=failure_type,
+            )
+
+        except (ValueError, LookupError):
+            # Another worker may have reclaimed the job after the
+            # original lease expired. Never let a stale worker change
+            # the status of a job it no longer owns.
+            logger.warning(
+                "Airtable sync failure could not be recorded because "
+                "the job claim is no longer valid."
+            )
 
         return False
+
+    # Record successful synchronization using the same claim token.
+    try:
+        storage.mark_airtable_sync_synced(
+            job_id=job_id,
+            airtable_record_id=airtable_record_id,
+            claim_token=claim_token,
+        )
+
+    except (ValueError, LookupError):
+        # The lease may have expired while the Airtable request was
+        # running, allowing another worker to reclaim the job.
+        logger.warning(
+            "Airtable sync succeeded externally, but the local job "
+            "could not be marked as synced because its claim is no "
+            "longer valid."
+        )
+        return False
+
+    logger.info("Airtable sync job completed successfully.")
+    return True
 
 
 def process_pending_airtable_sync_jobs(
     limit: int = 100,
     client: AirtableClient | None = None,
 ) -> dict:
-    """Promote due retries and process pending Airtable synchronization jobs."""
+    """Promote due retries and process pending Airtable sync jobs."""
 
     if limit <= 0:
         raise ValueError("limit must be greater than zero.")
 
-    promoted = storage.promote_due_airtable_sync_retries(limit=limit)
+    promoted = storage.promote_due_airtable_sync_retries(
+        limit=limit
+    )
 
     if promoted:
         logger.info(
@@ -204,6 +249,7 @@ def process_pending_airtable_sync_jobs(
 
             if success:
                 summary["succeeded"] += 1
+
             else:
                 updated_job = storage.get_airtable_sync_job(job_id)
 
